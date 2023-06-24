@@ -1,13 +1,15 @@
 """
 Minimal distance cover for a finite metric space.
 """
-from typing import List, Iterable, Tuple, Dict
+from typing import List, Iterable, Tuple, Dict, FrozenSet
+from itertools import chain
 from pysat.formula import WCNF, IDPool
 from pysat.card import EncType, CardEnc
 from .util import solve_maxsat, enumerate_maxsat
 from .metric import MetricSpace, MetricElement, pair_dist, MPAIR
 
 DIST = Dict[int, List[MetricElement]]
+PAIR = FrozenSet[MetricElement]
 
 def get_values(pool: IDPool, soln: List[int],
                stem: str = 'x',
@@ -21,39 +23,47 @@ def get_values(pool: IDPool, soln: List[int],
         sel = [pool.obj(_) for _ in soln if _ > 0]
     return [_[1] for _ in sel if _ is not None and _[0] == stem]
 
+def _normalize(pair: PAIR) -> PAIR:
+    """
+    Normalize
+    """
+    return pair if pair[0] < pair[1] else (pair[1], pair[0])
+
 def extended_model(distances: DIST, cnf: WCNF, pool: IDPool):
     """
     Calculate various sets that we need for the extended model.
     """
-    partner = {}
     support = {}
+    #partner[d,x]: set of y such that dist(x,y) = d
+    covers = {}
+    # support[d] is the set of all elements that can yield d
     for dist, pairs in distances.items():
-        if dist not in support:
-            support[dist] = set()
-        for elt1, elt2 in pairs:
-            support[dist].update([elt1, elt2])
-            if (dist, elt1) not in partner:
-                partner[dist, elt1] = set()
-            partner[dist, elt1].add(elt2)
-            if (dist, elt2) not in partner:
-                partner[dist, elt2] = set()
-            partner[dist, elt2].add(elt1)
+        support[dist] = set(chain(*pairs))
+        covers[dist] = set(map(frozenset, pairs))
 
     for dist, pairs in distances.items():
         dvar = pool.id(('d', dist))
         for elt in support[dist]:
-            lits = []
-            for eltx in partner[dist, elt]:
-                ekey = (elt, eltx) if elt < eltx else (eltx, elt)
-                lits.append(pool.id(('w', ekey)))
-            cnf.append([-dvar] + lits + [pool.id(('x', elt))])
-                            
+            # Is elt is involved in some pair
+            # if one of the w's is true then x is there
+            lits = [pool.id(('w', _, dist))
+                    for _ in covers[dist] if elt in _]
+            for clause in CardEnc.atmost(
+                    lits = lits + [- pool.id(('x', elt))],
+                    bound = 1,
+                    encoding = EncType.ladder,
+                    vpool = pool).clauses:
+                cnf.append([-dvar] + clause)
+        # w({i,j},d) means {i,j} is the chosen one for d
+
         for clause in CardEnc.equals(
-                lits = [pool.id(('w',_,dist)) for _ in pairs],
+                lits = [pool.id(('w', _ ,dist))
+                        for _ in covers[dist]],
                 bound = 1,
                 encoding = EncType.ladder,
-                pool = vpool).clauses:
+                vpool = pool).clauses:
             cnf.append([-dvar] + clause)
+        # Each distance needs at least 2 candidates
         cnf.extend(CardEnc.atleast(
             lits = [pool.id(('x', elt))
                     for elt in support[dist]],
@@ -61,7 +71,7 @@ def extended_model(distances: DIST, cnf: WCNF, pool: IDPool):
             encoding = EncType.totalizer,
             vpool = pool))
         
-def simple_cover(distances: DIST, cnf: WCNF, pool: IDPool):
+def simple_model(distances: DIST, cnf: WCNF, pool: IDPool):
     """
     Simple model.
     """
@@ -117,12 +127,13 @@ def distance_cover(space: MetricSpace,
 
 def distance_solve(space: MetricSpace,
                    bound: int = 0,
+                   simple: bool = False,
                    **kwds) -> List[MetricElement]:
     """
     Get one solution.
     """
 
-    cnf, pool = distance_cover(space, bound=bound)
+    cnf, pool = distance_cover(space, bound=bound, simple=simple)
     soln = solve_maxsat(cnf, **kwds)
     if bound > 0:
         return get_values(pool, soln, stem='d', neg=True)
